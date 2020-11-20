@@ -36,6 +36,7 @@ void initClientMultiState(client *c) {
     c->mstate.commands = NULL;
     c->mstate.count = 0;
     c->mstate.cmd_flags = 0;
+    c->mstate.cmd_inv_flags = 0;
 }
 
 /* Release all the resources associated with MULTI/EXEC state */
@@ -76,6 +77,7 @@ void queueMultiCommand(client *c) {
         incrRefCount(mc->argv[j]);
     c->mstate.count++;
     c->mstate.cmd_flags |= c->cmd->flags;
+    c->mstate.cmd_inv_flags |= ~c->cmd->flags;
 }
 
 void discardTransaction(client *c) {
@@ -85,7 +87,7 @@ void discardTransaction(client *c) {
     unwatchAllKeys(c);
 }
 
-/* Flag the transacation as DIRTY_EXEC so that EXEC will fail.
+/* Flag the transaction as DIRTY_EXEC so that EXEC will fail.
  * Should be called every time there is an error while queueing a command. */
 void flagTransaction(client *c) {
     if (c->flags & CLIENT_MULTI)
@@ -98,6 +100,7 @@ void multiCommand(client *c) {
         return;
     }
     c->flags |= CLIENT_MULTI;
+
     addReply(c,shared.ok);
 }
 
@@ -122,6 +125,24 @@ void execCommandPropagateExec(client *c) {
               PROPAGATE_AOF|PROPAGATE_REPL);
 }
 
+/* Aborts a transaction, with a specific error message.
+ * The transaction is always aboarted with -EXECABORT so that the client knows
+ * the server exited the multi state, but the actual reason for the abort is
+ * included too.
+ * Note: 'error' may or may not end with \r\n. see addReplyErrorFormat. */
+void execCommandAbort(client *c, sds error) {
+    discardTransaction(c);
+
+    if (error[0] == '-') error++;
+    addReplyErrorFormat(c, "-EXECABORT Transaction discarded because of: %s", error);
+
+    /* Send EXEC to clients waiting data from MONITOR. We did send a MULTI
+     * already, and didn't send any of the queued commands, now we'll just send
+     * EXEC so it is clear that the transaction is over. */
+    if (listLength(server.monitors) && !server.loading)
+        replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
+}
+
 void execCommand(client *c) {
     int j;
     robj **orig_argv;
@@ -132,15 +153,6 @@ void execCommand(client *c) {
 
     if (!(c->flags & CLIENT_MULTI)) {
         addReplyError(c,"EXEC without MULTI");
-        return;
-    }
-
-    /* If we are in -BUSY state, flag the transaction and return the
-     * -BUSY error, like Redis <= 5. This is a temporary fix, may be changed
-     *  ASAP, see issue #7353 on Github. */
-    if (server.lua_timedout) {
-        flagTransaction(c);
-        addReply(c, shared.slowscripterr);
         return;
     }
 
@@ -157,20 +169,10 @@ void execCommand(client *c) {
         goto handle_monitor;
     }
 
-    /* If there are write commands inside the transaction, and this is a read
-     * only slave, we want to send an error. This happens when the transaction
-     * was initiated when the instance was a master or a writable replica and
-     * then the configuration changed (for example instance was turned into
-     * a replica). */
-    if (!server.loading && server.masterhost && server.repl_slave_ro &&
-        !(c->flags & CLIENT_MASTER) && c->mstate.cmd_flags & CMD_WRITE)
-    {
-        addReplyError(c,
-            "Transaction contains write commands but instance "
-            "is now a read-only replica. EXEC aborted.");
-        discardTransaction(c);
-        goto handle_monitor;
-    }
+    uint64_t old_flags = c->flags;
+
+    /* we do not want to allow blocking commands inside multi */
+    c->flags |= CLIENT_DENY_BLOCKING;
 
     /* Exec all the queued commands */
     unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
@@ -210,6 +212,7 @@ void execCommand(client *c) {
                 "no permission to touch the specified keys");
         } else {
             call(c,server.loading ? CMD_CALL_NONE : CMD_CALL_FULL);
+            serverAssert((c->flags & CLIENT_BLOCKED) == 0);
         }
 
         /* Commands may alter argc/argv, restore mstate. */
@@ -217,6 +220,11 @@ void execCommand(client *c) {
         c->mstate.commands[j].argv = c->argv;
         c->mstate.commands[j].cmd = c->cmd;
     }
+
+    // restore old DENY_BLOCKING value
+    if (!(old_flags & CLIENT_DENY_BLOCKING))
+        c->flags &= ~CLIENT_DENY_BLOCKING;
+
     c->argv = orig_argv;
     c->argc = orig_argc;
     c->cmd = orig_cmd;

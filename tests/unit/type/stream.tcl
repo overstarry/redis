@@ -102,6 +102,18 @@ start_server {
         }
     }
 
+    test {XADD with NOMKSTREAM option} {
+        r DEL mystream
+        assert_equal "" [r XADD mystream NOMKSTREAM * item 1 value a]
+        assert_equal 0 [r EXISTS mystream]
+        r XADD mystream * item 1 value a
+        r XADD mystream NOMKSTREAM * item 2 value b
+        assert_equal 2 [r XLEN mystream]
+        set items [r XRANGE mystream - +]
+        assert_equal [lindex $items 0 1] {item 1 value a}
+        assert_equal [lindex $items 1 1] {item 2 value b}
+    }
+
     test {XADD mass insertion and XLEN} {
         r DEL mystream
         r multi
@@ -459,5 +471,12 @@ start_server {tags {"stream"} overrides {appendonly yes aof-use-rdb-preamble no}
         r debug loadaof
         assert {[dict get [r xinfo stream mystream] length] == 1}
         assert {[dict get [r xinfo stream mystream] last-generated-id] == "2-2"}
+    }
+}
+
+start_server {tags {"stream"}} {
+    test {XGROUP HELP should not have unexpected options} {
+        catch {r XGROUP help xxx} e
+        assert_match "*Unknown subcommand or wrong number of arguments*" $e
     }
 }
